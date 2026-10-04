@@ -1,0 +1,143 @@
+# The manual updates in job step "Login & Process Deployment" below:
+# - variables for additional branches: add SFDX_CLIENT_ID / KEY variables
+# - To use Slack notifications, you can also define SLACK_TOKEN and SLACK_CHANNEL_ID
+#   - For branch scoped messages, add SLACK_CHANNEL_ID_ + branch name (ex: SLACK_CHANNEL_ID_INTEGRATION, SLACK_CHANNEL_ID_UAT)
+
+on:
+    pull_request:
+        # Add your major branches names here
+        branches:
+            #            - main
+            - develop
+#    push:
+#        # Add your major branches names here
+#        branches:
+#            #            - main
+#            #            - develop
+
+permissions: read-all
+name: Validate Deployment
+run-name: 'PR #${{ github.event.pull_request.number }}: ${{ github.event.pull_request.title }} by @${{ github.actor }} (Target → ${{ github.base_ref }})'
+
+
+concurrency:
+    group: ${{ github.ref }}-${{ github.workflow }}
+    cancel-in-progress: true
+
+jobs:
+    check_deployment:
+        runs-on: ubuntu-latest
+        name: Validate Changes
+        permissions:
+            pull-requests: write
+            contents: write
+            issues: write
+        steps:
+            # Checkout repo
+            -   name: Checkout repository
+                uses: actions/checkout@v4
+                with:
+                    persist-credentials: true
+                    token: ${{ secrets.PAT || secrets.GITHUB_TOKEN }}
+                    fetch-depth: 0 # Fetch all branches
+            # Setup node and cache npm folder
+            -   name: Setup Node
+                uses: actions/setup-node@v4
+                with:
+                    node-version: "24.0.0"
+                    cache: 'npm'
+            -   name: Prepare Test Classes
+                id: prepare_tests
+                run: |
+                    echo "Check if ci_testrun folder exists"
+                    if [ -d "ci_testrun" ]; then
+                      echo "Creating a space-separated string of all files in the ci_testrun folder for running specified tests"
+                      TEST_CLASSES=$(find ci_testrun -type f -name "*.cls" | sed 's/\.cls$//' | sed 's/^ci_testrun\///' | tr '\n' ' ')
+
+                      # Trim leading/trailing whitespace
+                      TEST_CLASSES=$(echo "$TEST_CLASSES" | xargs)
+                        if [ -n "$TEST_CLASSES" ]; then
+                            echo "Found test classes: $TEST_CLASSES"
+                            echo "TEST_CLASSES=$TEST_CLASSES" >> $GITHUB_ENV
+                            echo "SPECIFIED_TESTS=$TEST_CLASSES" >> $GITHUB_ENV
+                            echo "Using RunSpecifiedTests test level"
+                            echo "SFDX_DEVELOP_TEST_LEVEL_SPECIFIED_TESTS=RunSpecifiedTests" >> $GITHUB_ENV
+                        else
+                            echo "No test classes found in ci_testrun folder"
+                        fi
+                    else
+                      echo "ci_testrun folder not found"
+                    fi
+            # SFDX & plugins
+            -   name: Install SFDX and plugins
+                run: |
+                    # Use this if you don't want to cache. npm install --no-cache @salesforce/cli --global
+                    npm install @salesforce/cli --global
+                    echo 'y' | sf plugins install sfdx-git-delta
+                    sf version --verbose --json
+            -   name: Generate Delta Package
+                id: delta
+                run: |
+                    echo "Getting the latest deployment tag"
+                    LATEST_TAG=$(git tag -l "v*" --sort=-creatordate | head -n 1)
+
+                    # If no tag exists, use initial commit
+                    if [ -z "$LATEST_TAG" ]; then
+                      LATEST_TAG=$(git rev-list --max-parents=0 HEAD)
+                      echo "No previous deployment tag found, using initial commit as base"
+                    else
+                      echo "Found latest deployment tag: $LATEST_TAG"
+                    fi
+
+
+                    echo "Generate delta package between latest tag and current HEAD"
+                    mkdir -p deploy/delta
+                    sf sgd:source:delta --from "$LATEST_TAG" --to HEAD --output-dir deploy/delta --generate-delta
+
+
+                    echo "LATEST_TAG=$LATEST_TAG" >> $GITHUB_ENV
+            -   name: Replace Strings
+                id: replace_strings
+                env:
+                    isValidate: 'true'
+                    RUN_SCRIPT_REPLACEMENT: ${{ vars.RUN_SCRIPT_REPLACEMENT}}
+                if: ${{ env.RUN_SCRIPT_REPLACEMENT == 'true' }}
+                run: |
+                    echo "Replacing strings in scripts. RUN_SCRIPT_REPLACEMENT value: ${{ env.RUN_SCRIPT_REPLACEMENT }}"
+                    node scripts/node/replaceStrings.js
+            -   name: Create temporary auth file
+                run: |
+                    (echo ${{ secrets.SFDX_QA_AUTH_URL_FILE }}) > temp-auth.txt
+                    echo "AUTH FILE: Created temp-auth.txt to login to Salesforce"
+            # Login & deploy with test classes & code coverage
+            -   name: Login & Process Deployment
+                env:
+                    SFDX_DEVELOP_TEST_LEVEL: ${{ vars.SFDX_DEVELOP_TEST_LEVEL}}
+                    SFDX_CLIENT_ID_DEVELOP: ${{ secrets.SFDX_CLIENT_ID_DEVELOP}}
+                    SFDX_CLIENT_KEY_DEVELOP: ${{ secrets.SFDX_CLIENT_KEY_DEVELOP}}
+                    SFDX_CLIENT_ID_INTEGRATION: ${{ secrets.SFDX_CLIENT_ID_INTEGRATION}}
+                    SFDX_DEPLOY_WAIT_MINUTES: 120 # Override if necessary
+                    SFDX_TEST_WAIT_MINUTES: 120 # Override if necessary
+                    CI_COMMIT_REF_NAME: ${{ github.event.pull_request.base.ref }} # Defines the target branch of the PR
+                    ORG_ALIAS: ${{ github.event.pull_request.base.ref }} # Defines the target branch of the PR
+                    CONFIG_BRANCH: ${{ github.event.pull_request.base.ref }} # Defines the target branch of the PR
+                    SOURCE_BRANCH: ${{ github.event.pull_request.head.ref }} # Defines the source branch of the PR
+                    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                    NOTIF_EMAIL_ADDRESS: ${{ secrets.NOTIF_EMAIL_ADDRESS }}
+                    FORCE_COLOR: "1"
+                    SFDX_DISABLE_FLOW_DIFF: true # Set to true to disable Flow doc during CI/CD
+                run: |
+                    echo "Validate changes to Salesforce from '$LATEST_TAG' to HEAD"
+                    echo "AUTH FILE: Reading file to log in."
+                    sf org login sfdx-url --sfdx-url-file temp-auth.txt -s
+                    echo "AUTH FILE: Cleaning up auth file."
+                    rm temp-auth.txt
+
+                    # Validate the changes, the --dry-run executes the validation.
+                    if [ -n "$TEST_CLASSES" ] && [ "$SFDX_DEVELOP_TEST_LEVEL_SPECIFIED_TESTS" == "RunSpecifiedTests" ]; then
+                        echo "Running specified test classes: $TEST_CLASSES"
+                        sf project deploy start --dry-run --test-level RunSpecifiedTests --tests $TEST_CLASSES --source-dir deploy/delta -w ${{ env.SFDX_TEST_WAIT_MINUTES }}
+                    else
+                        echo "Using default test level: $SFDX_DEVELOP_TEST_LEVEL"
+                        sf project deploy start --dry-run --test-level ${{env.SFDX_DEVELOP_TEST_LEVEL}} --source-dir deploy/delta -w ${{ env.SFDX_TEST_WAIT_MINUTES }}
+                    fi
